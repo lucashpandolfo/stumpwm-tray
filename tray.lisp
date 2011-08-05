@@ -86,9 +86,14 @@
 	(:selection-request () (format t "Selection request event~%"))
 	(:selection-notify () (format t "Selection notify event~%"))
 	(:selection-clear () (format t "Selection clear event~%") t)
+	(:property-notify (atom state time window) (format t "Property notify (~a) ~a ~a ~a~%" window atom state time))
 	;(:key-press () (format t "Key press event~%") (process-click) nil)
 	(:visibility-notify (state) (visibility-changed my-window state) nil)
-	(:configure-request (width height x y window) (format t "W: ~a H: ~a X: ~a Y: ~a from window: ~a~%" width height x y window) nil)
+	(:configure-request (width height x y window) 
+			    (format t "W: ~a H: ~a X: ~a Y: ~a from window: ~a~%" width height x y window) 
+			    (resize-icon window width height)
+			    (reorganize-icons my-window *client-windows*)
+			    nil)
 	(:destroy-notify (window) (format t "Window ~a destroyed~%" window) 
 			 (remove-client window) 
 			 (reorganize-icons my-window *client-windows*) nil)
@@ -122,13 +127,16 @@
 	 (format t "Client XEMBED protocol version: ~a~%" client-protocol-version)
 	 (send-xembed-message window client-window +xembed-embedded-notify+)
 	 (format t "XEMBED embedded notify message sent to ~a ~%" (get-window-name client-window))
-	 (resize-drawable client-window *tray-icon-width* *tray-icon-height*)
+	 (resize-drawable client-window
+			  *tray-icon-width*
+			  *tray-icon-height*)
 	 (reorganize-icons window *client-windows*)
 	 (xlib:map-window client-window)))
     (1 (format t "Begin Message event~%"))
     (2 (format t "End Message event~%"))
     (otherwise (format t "Unknown message received.")))
   nil)
+
 
 (defun get-window-name (window)
   (xlib:get-property window :_NET_WM_NAME :type :UTF8_STRING :result-type 'string :transform #'code-char))
@@ -173,8 +181,10 @@
   (xlib:display-finish-output (xlib:window-display window)))
 
 (defun resize-drawable (drawable width height)
-  (setf (xlib:drawable-height drawable) width)
-  (setf (xlib:drawable-width drawable) height))
+  (format t "resizing drawable to ~a ~a ~%" width height)
+  (unless (or (eq width 0) (eq height 0))
+    (setf (xlib:drawable-height drawable) width)
+    (setf (xlib:drawable-width drawable) height)))
 
 (defun position-window (window x y)
   (xlib:send-event (get-parent-window window) :configure-request #xfff 
@@ -183,21 +193,46 @@
   (xlib:display-finish-output (xlib:window-display window)))
 
 (defun position-subwindow (parent window x y)
+  (format t "positioning window at ~a ~a~%" x y)
   (xlib:reparent-window window parent x y)
   (xlib:display-finish-output (xlib:window-display window)))
+
+(defun get-window-max-dimensions (window)
+  (let ((hints (xlib:get-property window :WM_NORMAL_HINTS :type nil)))
+    (format t "Dimensions: ~a~%" hints)
+    (list (nth 5 hints) (nth 6 hints))))
+
+(defun get-window-max-width (window)
+  (car (get-window-max-dimensions window)))
+
+(defun get-window-max-height (window)
+  (cadr (get-window-max-dimensions window)))
 
 (defun reorganize-icons (window clients)
   (loop for i in clients
      do
-       (position-subwindow window i total-width 0)
-     summing (xlib:drawable-width i) into total-width
-     maximizing (xlib:drawable-height i) into total-height
+       (position-subwindow window i 
+			   (round 
+			    (+ total-width 
+			       (/ (- *tray-icon-width*
+				     (xlib:drawable-width i)) 2)))
+			   (round 
+			    (/ (- *tray-icon-height* 
+				  (xlib:drawable-height i)) 2)))
+     summing *tray-icon-width* into total-width
+     ;maximizing (xlib:drawable-height i) into total-height
      finally
-       (format t "Ancho = ~a Alto = ~a ~%" total-width total-height)
-       (if (and (> total-width 0) (> total-height 0))
-	   (resize-window window total-width total-height)
+       (format t "Ancho = ~a Alto = ~a ~%" total-width *tray-icon-height*)
+       (if (> total-width 0)
+	   (resize-window window total-width *tray-icon-height*)
 	   (resize-window window 1 1)))
   nil)
+
+(defun resize-icon (window width height)
+  (resize-drawable window
+		   (min width *tray-icon-width*)
+		   (min height *tray-icon-height*)))
+
 
 (defun get-root-window (window)
   (xlib:drawable-root window))
@@ -208,46 +243,5 @@
     (declare (ignore children root))
     parent))
 
-(get-parent-window *client-window*)
-
-(reorganize-icons *window* *client-windows*)
-(resize-window *window* 100 100)
-(resize-window  (first *client-windows*) 32 32)
-(xlib:unmap-window (first *client-windows*))
-(xlib:map-window (first *client-windows*))
-
-(xlib:warp-pointer *root-window* 100 100)
-(xlib:display-finish-output *display*)
-(xlib:set-input-focus *display* *client-window* *client-window* (get-timestamp *display* *window*))
-
-*display* *window* *client-window*
-
-(xlib:get-property *client-window* :WM_ICON_NAME :type nil :transform #'code-char)
-(xlib:change-property *window* :_NET_WM_STATE '(:_NET_WM_STATE_MODAL) :ATOM 32)
-
-(car (xlib:display-roots *display*))
-(xlib:get-property *client-window* :WM_NAME :type nil :transform #'code-char)
-(xlib:get-property (third *client-windows*) :_NET_WM_ICON :type nil)
-(xlib:get-property (third *client-windows*) :WM_NORMAL_HINTS :type nil)
-
-(xlib:send-event *client-window* :exposure #xffff :window *client-window* :x 0 :y 0 :width 48 :height 48 :count 0)
-
-(xlib:change-property *window* :WM_NAME (coerce "Stumpwm system tray" 'list) :STRING 8 :transform #'char-code)
-
-(xlib:reparent-window *window* *root-window* 100 100)
-
-(xlib:reparent-window *client-window* *window* 40 0)
-
-(setf (xlib:drawable-height (first *client-windows*)) 22)
-(setf (xlib:drawable-width (first *client-windows*)) 22)
-
-(xlib:map-window (first *client-windows*)
-(xlib:display-finish-output *display*)
-
-(send-xembed-message *window* *client-window* +xembed-window-activate+)
-
-(progn (xlib:query-extension *display* "XTEST")
-       (xtest:fake-button-event *display* 1 t)
-       (xtest:fake-button-event *display* 1 nil))
 
 (tray)
