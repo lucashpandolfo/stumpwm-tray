@@ -43,6 +43,143 @@
 				(t (error "~a is not a valid keyword in the reconfigure mask" x))))
 		  keywords)))
 
+(defun get-timestamp (window)
+  (xlib:change-property window :WM_CLASS () :STRING 8 :mode :append) 
+  (xlib:event-case ((xlib:window-display window) :force-output-p t
+			    :discard-p nil)
+    (:property-notify (time)
+		      (format t "Timestamp: ~a~%" time)
+		      time)
+    (t () nil)))
+
+(defun get-root-window (window)
+  (xlib:drawable-root window))
+
+(defun get-parent-window (window)
+  (multiple-value-bind (children parent root)
+      (xlib:query-tree window)
+    (declare (ignore children root))
+    parent))
+
+(defun acquire-selection (window selection-name)
+  (setf (xlib:selection-owner (xlib:window-display window) selection-name (get-timestamp window)) window)
+  (if (xlib:window-equal window (xlib:selection-owner (xlib:window-display window) selection-name))
+      t
+      nil))
+
+(defun get-window-name (window)
+  (xlib:get-property window :_NET_WM_NAME :type :UTF8_STRING :result-type 'string :transform #'code-char))
+
+(defun xembed-message-extra-data (window message-type)
+  (let ((data
+	 (if (eq message-type +xembed-embedded-notify+)
+	     (list (xlib:window-id window) 1)
+	     nil)))
+    (format t "data: ~a~%" data)
+    data))
+
+(defun send-xembed-message (window dst-window message-type &optional (subtype 0))
+  (xlib:send-event dst-window
+		   :client-message #xfff :propagate-p nil :display (xlib:window-display window)
+		   :window dst-window :format 32
+		   :type :_XEMBED :event-window dst-window
+		   :data (append (list (get-timestamp window) message-type subtype)
+				 (xembed-message-extra-data window message-type)))
+  (xlib:display-finish-output (xlib:window-display window)))
+
+(defun remove-client (window)
+  (setf *client-windows* (remove window *client-windows* :test #'xlib:window-equal)))
+
+(defun visibility-changed (window state)
+  (format t "Visibility for window ~a changed to ~a~%" window state))
+
+(defun resize-window (window width height)
+  (xlib:send-event (get-root-window window) :configure-request #xfff 
+		   :parent (get-root-window window) :window window 
+		   :width width :height height 
+		   :value-mask (make-reconfigure-mask :width :height))
+  (xlib:display-finish-output (xlib:window-display window)))
+
+(defun resize-drawable (drawable width height)
+  (format t "resizing drawable to ~a ~a ~%" width height)
+  (unless (or (eq width 0) (eq height 0))
+    (setf (xlib:drawable-height drawable) width)
+    (setf (xlib:drawable-width drawable) height)))
+
+(defun resize-icon (window width height)
+  (resize-drawable window
+		   (min width *tray-icon-width*)
+		   (min height *tray-icon-height*)))
+
+(defun position-window (window x y)
+  (xlib:send-event (get-parent-window window) :configure-request #xfff 
+		   :parent (get-parent-window window) :window window 
+		   :x x :y y :value-mask (make-reconfigure-mask :x :y))
+  (xlib:display-finish-output (xlib:window-display window)))
+
+(defun position-subwindow (parent window x y)
+  (format t "positioning window at ~a ~a~%" x y)
+  (xlib:reparent-window window parent x y)
+  (xlib:display-finish-output (xlib:window-display window)))
+
+(defun get-window-max-dimensions (window)
+  (let ((hints (xlib:get-property window :WM_NORMAL_HINTS :type nil)))
+    (format t "Dimensions: ~a~%" hints)
+    (list (nth 5 hints) (nth 6 hints))))
+
+(defun get-window-max-width (window)
+  (car (get-window-max-dimensions window)))
+
+(defun get-window-max-height (window)
+  (cadr (get-window-max-dimensions window)))
+
+(defun reorganize-icons (window clients)
+  (loop for i in clients
+     do
+       (position-subwindow window i 
+			   (round 
+			    (+ total-width 
+			       (/ (- *tray-icon-width*
+				     (xlib:drawable-width i)) 2)))
+			   (round 
+			    (/ (- *tray-icon-height* 
+				  (xlib:drawable-height i)) 2)))
+     summing *tray-icon-width* into total-width
+     finally
+       (format t "Ancho = ~a Alto = ~a ~%" total-width *tray-icon-height*)
+       (if (> total-width 0)
+	   (resize-window window total-width *tray-icon-height*)
+	   (resize-window window 1 1)))
+  nil)
+
+(defgeneric process-client-message (window type format data)
+  (:documentation "Process client messages"))
+
+(defmethod process-client-message (window (type (eql :_XEMBED)) format data)
+  (format t "_XEMBED message received: format:  ~a data: ~a ~%" format data))
+
+(defmethod process-client-message (window (type (eql :_NET_SYSTEM_TRAY_OPCODE)) format data)
+  (format t "Event type _NET_SYSTEM_TRAY_OPCODE~%")
+  (case (aref data 1)
+    (0 (format t "Window ~a requests dock~%" (aref data 2))
+       (let* ((client-window (xlib::make-window :id (aref data 2) :display (xlib:window-display window)))
+	      (client-protocol-version (xlib:get-property  client-window "_XEMBED_INFO" :type nil)))
+	 (setf *client-window* client-window)
+	 (push client-window *client-windows*)
+	 (xlib:reparent-window client-window window 0 0)
+	 (format t "Window reparented~%")
+	 (format t "Client XEMBED protocol version: ~a~%" client-protocol-version)
+	 (send-xembed-message window client-window +xembed-embedded-notify+)
+	 (format t "XEMBED embedded notify message sent to ~a ~%" (get-window-name client-window))
+	 (resize-drawable client-window
+			  *tray-icon-width*
+			  *tray-icon-height*)
+	 (reorganize-icons window *client-windows*)
+	 (xlib:map-window client-window)))
+    (1 (format t "Begin Message event~%"))
+    (2 (format t "End Message event~%"))
+    (otherwise (format t "Unknown message received.")))
+  nil)
 
 (defun tray (&optional (host ""))
   (let* ((display (xlib:open-display host))
@@ -101,147 +238,5 @@
 			 (process-client-message my-window type format data))))
     (xlib:destroy-window my-window)
     (xlib:close-display display)))
-
-(defun acquire-selection (window selection-name)
-  (setf (xlib:selection-owner (xlib:window-display window) selection-name (get-timestamp window)) window)
-  (if (xlib:window-equal window (xlib:selection-owner (xlib:window-display window) selection-name))
-      t
-      nil))
-
-(defgeneric process-client-message (window type format data)
-  (:documentation "Process client messages"))
-
-(defmethod process-client-message (window (type (eql :_XEMBED)) format data)
-  (format t "_XEMBED message received: format:  ~a data: ~a ~%" format data))
-
-(defmethod process-client-message (window (type (eql :_NET_SYSTEM_TRAY_OPCODE)) format data)
-  (format t "Event type _NET_SYSTEM_TRAY_OPCODE~%")
-  (case (aref data 1)
-    (0 (format t "Window ~a requests dock~%" (aref data 2))
-       (let* ((client-window (xlib::make-window :id (aref data 2) :display (xlib:window-display window)))
-	      (client-protocol-version (xlib:get-property  client-window "_XEMBED_INFO" :type nil)))
-	 (setf *client-window* client-window)
-	 (push client-window *client-windows*)
-	 (xlib:reparent-window client-window window 0 0)
-	 (format t "Window reparented~%")
-	 (format t "Client XEMBED protocol version: ~a~%" client-protocol-version)
-	 (send-xembed-message window client-window +xembed-embedded-notify+)
-	 (format t "XEMBED embedded notify message sent to ~a ~%" (get-window-name client-window))
-	 (resize-drawable client-window
-			  *tray-icon-width*
-			  *tray-icon-height*)
-	 (reorganize-icons window *client-windows*)
-	 (xlib:map-window client-window)))
-    (1 (format t "Begin Message event~%"))
-    (2 (format t "End Message event~%"))
-    (otherwise (format t "Unknown message received.")))
-  nil)
-
-
-(defun get-window-name (window)
-  (xlib:get-property window :_NET_WM_NAME :type :UTF8_STRING :result-type 'string :transform #'code-char))
-
-(defun send-xembed-message (window dst-window message-type &optional (subtype 0))
-  (xlib:send-event dst-window
-		   :client-message #xfff :propagate-p nil :display (xlib:window-display window)
-		   :window dst-window :format 32
-		   :type :_XEMBED :event-window dst-window
-		   :data (append (list (get-timestamp window) message-type subtype)
-				 (xembed-message-extra-data window message-type)))
-  (xlib:display-finish-output (xlib:window-display window)))
-
-(defun xembed-message-extra-data (window message-type)
-  (let ((data
-	 (if (eq message-type +xembed-embedded-notify+)
-	     (list (xlib:window-id window) 1)
-	     nil)))
-    (format t "data: ~a~%" data)
-    data))
-
-(defun get-timestamp (window)
-  (xlib:change-property window :WM_CLASS () :STRING 8 :mode :append) 
-  (xlib:event-case ((xlib:window-display window) :force-output-p t
-			    :discard-p nil)
-    (:property-notify (time)
-		      (format t "Timestamp: ~a~%" time)
-		      time)
-    (t () nil)))
-
-(defun remove-client (window)
-  (setf *client-windows* (remove window *client-windows* :test #'xlib:window-equal)))
-
-(defun visibility-changed (window state)
-  (format t "Visibility for window ~a changed to ~a~%" window state))
-
-(defun resize-window (window width height)
-  (xlib:send-event (get-root-window window) :configure-request #xfff 
-		   :parent (get-root-window window) :window window 
-		   :width width :height height 
-		   :value-mask (make-reconfigure-mask :width :height))
-  (xlib:display-finish-output (xlib:window-display window)))
-
-(defun resize-drawable (drawable width height)
-  (format t "resizing drawable to ~a ~a ~%" width height)
-  (unless (or (eq width 0) (eq height 0))
-    (setf (xlib:drawable-height drawable) width)
-    (setf (xlib:drawable-width drawable) height)))
-
-(defun position-window (window x y)
-  (xlib:send-event (get-parent-window window) :configure-request #xfff 
-		   :parent (get-parent-window window) :window window 
-		   :x x :y y :value-mask (make-reconfigure-mask :x :y))
-  (xlib:display-finish-output (xlib:window-display window)))
-
-(defun position-subwindow (parent window x y)
-  (format t "positioning window at ~a ~a~%" x y)
-  (xlib:reparent-window window parent x y)
-  (xlib:display-finish-output (xlib:window-display window)))
-
-(defun get-window-max-dimensions (window)
-  (let ((hints (xlib:get-property window :WM_NORMAL_HINTS :type nil)))
-    (format t "Dimensions: ~a~%" hints)
-    (list (nth 5 hints) (nth 6 hints))))
-
-(defun get-window-max-width (window)
-  (car (get-window-max-dimensions window)))
-
-(defun get-window-max-height (window)
-  (cadr (get-window-max-dimensions window)))
-
-(defun reorganize-icons (window clients)
-  (loop for i in clients
-     do
-       (position-subwindow window i 
-			   (round 
-			    (+ total-width 
-			       (/ (- *tray-icon-width*
-				     (xlib:drawable-width i)) 2)))
-			   (round 
-			    (/ (- *tray-icon-height* 
-				  (xlib:drawable-height i)) 2)))
-     summing *tray-icon-width* into total-width
-     ;maximizing (xlib:drawable-height i) into total-height
-     finally
-       (format t "Ancho = ~a Alto = ~a ~%" total-width *tray-icon-height*)
-       (if (> total-width 0)
-	   (resize-window window total-width *tray-icon-height*)
-	   (resize-window window 1 1)))
-  nil)
-
-(defun resize-icon (window width height)
-  (resize-drawable window
-		   (min width *tray-icon-width*)
-		   (min height *tray-icon-height*)))
-
-
-(defun get-root-window (window)
-  (xlib:drawable-root window))
-
-(defun get-parent-window (window)
-  (multiple-value-bind (children parent root)
-      (xlib:query-tree window)
-    (declare (ignore children root))
-    parent))
-
 
 (tray)
