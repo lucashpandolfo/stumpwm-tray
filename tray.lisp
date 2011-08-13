@@ -1,8 +1,7 @@
-(require 'clx)
+(in-package #:simpletray)
 
 (defparameter *display* nil)
-(defparameter *window* nil)
-(defparameter *client-window* nil)
+(defparameter *tray-window* nil)
 (defparameter *root-window* nil)
 (defparameter *client-windows* nil)
 (defparameter *tray-icon-width* 32)
@@ -164,7 +163,6 @@
     (0 (format t "Window ~a requests dock~%" (aref data 2))
        (let* ((client-window (xlib::make-window :id (aref data 2) :display (xlib:window-display window)))
 	      (client-protocol-version (xlib:get-property  client-window "_XEMBED_INFO" :type nil)))
-	 (setf *client-window* client-window)
 	 (push client-window *client-windows*)
 	 (xlib:reparent-window client-window window 0 0)
 	 (format t "Window reparented~%")
@@ -200,18 +198,18 @@
 						       :substructure-notify :substructure-redirect))))
     (setf *root-window* root-window)
     (setf *display* display)
-    (setf *window* my-window)
+    (setf *tray-window* my-window)
     (setf *client-windows* nil)
 
     (xlib:change-property my-window 
 			  :WM_TRANSIENT_FOR (list (xlib:window-id root-window))
 			  :WINDOW 32)
     
-    (xlib:change-property *window* 
+    (xlib:change-property *tray-window* 
 			  :WM_NAME (coerce "Stumpwm system tray" 'list) 
 			  :STRING 8 :transform #'char-code)
 
-    (xlib:change-property *window* 
+    (xlib:change-property *tray-window* 
 			  :_NET_WM_NAME (coerce "Stumpwm system tray" 'list) 
 			  :UTF8_STRING 8 :transform #'char-code)
 
@@ -236,7 +234,33 @@
 			 (reorganize-icons my-window *client-windows*) nil)
 	(:client-message (type format data)
 			 (process-client-message my-window type format data))))
-    (xlib:destroy-window my-window)
+    (destroy)
     (xlib:close-display display)))
 
-(tray)
+(defun create ()
+  (bordeaux-threads:make-thread 'tray :name "Tray: main loop thread"))
+
+(defun destroy ()
+  (when (xlib:window-p *tray-window*)
+    (let ((window *tray-window*))
+      (setf *tray-window* nil)
+      (xlib:destroy-window window))))
+
+(defun hide ()
+  (when (xlib:window-p *tray-window*)
+    (xlib:unmap-window *tray-window*)
+    (xlib:display-finish-output (xlib:window-display *tray-window*))))
+
+(defun show ()
+  (when (xlib:window-p *tray-window*)
+    (xlib:map-window *tray-window*)
+    (xlib:display-finish-output (xlib:window-display *tray-window*))
+    (reorganize-icons *tray-window* *client-windows*)))
+
+(defun toggle ()
+  (when (xlib:window-p *tray-window*)
+    (if (eq (xlib:window-map-state *tray-window*)
+	    :viewable)
+	(hide)
+	(show))))
+
